@@ -1,35 +1,81 @@
-#!/usr/bin/env python3
-"""
-Oracle Cloud Always Free ARM (A1.Flex) capacity catcher — single-attempt mode.
-DIAGNOSTIC VERSION: adds unbuffered print statements at every stage and a
-top-level catch-all so a silent failure becomes visible in the Actions log.
-"""
+name: Oracle ARM Capacity Catcher
 
-import os
-import sys
-import traceback
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
 
-print("=== catcher script starting ===", flush=True)
+permissions:
+  actions: write
+  contents: write
 
-try:
-    import logging
-    import oci
-    import requests
-    print("=== imports OK ===", flush=True)
-except Exception:
-    print("=== IMPORT FAILED ===", flush=True)
-    traceback.print_exc()
-    sys.exit(1)
+concurrency:
+  group: oracle-capacity-catcher
+  cancel-in-progress: false
 
-GITHUB_OUTPUT = os.getenv("GITHUB_OUTPUT")
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-def set_output(caught: bool) -> None:
-    print(f"=== set_output(caught={caught}) called, GITHUB_OUTPUT={GITHUB_OUTPUT!r} ===", flush=True)
-    if GITHUB_OUTPUT:
-        with open(GITHUB_OUTPUT, "a") as f:
-            f.write(f"caught={'true' if caught else 'false'}\n")
+      - name: Install dependencies
+        run: pip install oci requests
 
+      - name: Write OCI API config
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          EOF
+          printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem ~/.oci/config
 
-try:
-    COMPARTMENT_ID = os.environ["OCI_COMPARTMENT_ID"]
+      - name: Attempt launch
+        id: attempt
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_ADS: ${{ secrets.OCI_ADS }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          OCI_DISPLAY_NAME: openclaw-2
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python catch_instance_single.py
+
+      - name: Log status
+        if: always()
+        run: |
+          git config user.name "capacity-catcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git config pull.rebase true
+          echo "$(date -u +%FT%TZ) caught=${{ steps.attempt.outputs.caught }}" >> status.log
+          git add status.log
+          git commit -m "status: $(date -u +%FT%TZ)" -q
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "Push rejected, retrying ($i)..."
+            git fetch origin main
+            git rebase origin/main
+            sleep 5
+          done
+        continue-on-error: true
+
+      - name: Disable this schedule (instance caught)
+        if: steps.attempt.outputs.caught == 'true'
+        run: |
+          curl -X PUT \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/catch_instance.yml/disable
