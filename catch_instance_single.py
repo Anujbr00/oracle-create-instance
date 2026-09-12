@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Oracle Cloud Always Free ARM (A1.Flex) capacity catcher — single-attempt mode.
-DIAGNOSTIC VERSION: adds unbuffered print statements at every stage and a
-top-level catch-all so a silent failure becomes visible in the Actions log.
+Strips whitespace from every secret-derived value (handles copy-paste artifacts
+like trailing newlines) and prints safe diagnostics (lengths, character checks)
+that GitHub won't redact, since they aren't the literal secret values.
 """
 
 import os
@@ -25,27 +26,41 @@ GITHUB_OUTPUT = os.getenv("GITHUB_OUTPUT")
 
 
 def set_output(caught: bool) -> None:
-    print(f"=== set_output(caught={caught}) called, GITHUB_OUTPUT={GITHUB_OUTPUT!r} ===", flush=True)
+    print(f"=== set_output(caught={caught}) called ===", flush=True)
     if GITHUB_OUTPUT:
         with open(GITHUB_OUTPUT, "a") as f:
             f.write(f"caught={'true' if caught else 'false'}\n")
 
 
+def check(name: str, value: str) -> str:
+    """Strip a value and print safe (non-secret) facts about it."""
+    stripped = value.strip()
+    had_whitespace = stripped != value
+    has_quote = '"' in stripped or "'" in stripped
+    has_newline = "\n" in stripped or "\r" in stripped
+    print(
+        f"=== {name}: len={len(stripped)} had_surrounding_whitespace={had_whitespace} "
+        f"contains_quote_char={has_quote} contains_embedded_newline={has_newline} ===",
+        flush=True,
+    )
+    return stripped
+
+
 try:
-    COMPARTMENT_ID = os.environ["OCI_COMPARTMENT_ID"]
-    SUBNET_ID = os.environ["OCI_SUBNET_ID"]
+    COMPARTMENT_ID = check("OCI_COMPARTMENT_ID", os.environ["OCI_COMPARTMENT_ID"])
+    SUBNET_ID = check("OCI_SUBNET_ID", os.environ["OCI_SUBNET_ID"])
     OCI_ADS_RAW = os.environ["OCI_ADS"]
-    AVAILABILITY_DOMAINS = [a.strip() for a in OCI_ADS_RAW.split(",") if a.strip()]
-    IMAGE_ID = os.environ["OCI_IMAGE_ID"]
-    SSH_PUBLIC_KEY = os.environ["SSH_PUBLIC_KEY"]
-    SHAPE = os.getenv("OCI_SHAPE", "VM.Standard.A1.Flex")
+    AVAILABILITY_DOMAINS = [check(f"OCI_ADS[{i}]", a) for i, a in enumerate(OCI_ADS_RAW.split(",")) if a.strip()]
+    IMAGE_ID = check("OCI_IMAGE_ID", os.environ["OCI_IMAGE_ID"])
+    SSH_PUBLIC_KEY = check("SSH_PUBLIC_KEY", os.environ["SSH_PUBLIC_KEY"])
+    print(f"=== SSH_PUBLIC_KEY starts with 'ssh-': {SSH_PUBLIC_KEY.startswith('ssh-')} ===", flush=True)
+    SHAPE = os.getenv("OCI_SHAPE", "VM.Standard.A1.Flex").strip()
     OCPUS = float(os.getenv("OCI_OCPUS", "1"))
     MEMORY_GB = float(os.getenv("OCI_MEMORY_GB", "6"))
-    DISPLAY_NAME = os.getenv("OCI_DISPLAY_NAME", "openclaw-2")
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-    print(f"=== config loaded. ADs found: {AVAILABILITY_DOMAINS} (count={len(AVAILABILITY_DOMAINS)}) ===", flush=True)
-    print(f"=== compartment={COMPARTMENT_ID[:20]}... subnet={SUBNET_ID[:20]}... image={IMAGE_ID[:20]}... ===", flush=True)
+    DISPLAY_NAME = os.getenv("OCI_DISPLAY_NAME", "openclaw-2").strip()
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    print(f"=== config loaded. AD count={len(AVAILABILITY_DOMAINS)} ===", flush=True)
 except Exception:
     print("=== CONFIG/ENV LOADING FAILED ===", flush=True)
     traceback.print_exc()
@@ -115,7 +130,6 @@ def try_launch(compute_client, ad: str):
 def main():
     print("=== main() entered ===", flush=True)
     config = oci.config.from_file()
-    print(f"=== OCI config loaded from file, region={config.get('region')} ===", flush=True)
     compute_client = oci.core.ComputeClient(config)
     print("=== compute client created ===", flush=True)
 
@@ -131,11 +145,11 @@ def main():
 
     for ad in AVAILABILITY_DOMAINS:
         try:
-            print(f"=== Trying AD {ad}... ===", flush=True)
+            print(f"=== Trying AD (len={len(ad)})... ===", flush=True)
             instance = try_launch(compute_client, ad)
-            print(f"=== SUCCESS: {instance.id} in {ad} ===", flush=True)
+            print(f"=== SUCCESS: {instance.id} in AD ===", flush=True)
             notify_telegram(
-                f"🟢 Caught an instance!\nAD: {ad}\nID: {instance.id}\n"
+                f"🟢 Caught an instance!\nID: {instance.id}\n"
                 f"Check the OCI console for the public IP."
             )
             set_output(True)
@@ -143,7 +157,7 @@ def main():
         except oci.exceptions.ServiceError as e:
             print(f"=== ServiceError: code={e.code} status={e.status} message={e.message} ===", flush=True)
             if is_capacity_error(e):
-                print(f"=== No capacity in {ad} ===", flush=True)
+                print("=== No capacity in this AD ===", flush=True)
             elif e.status == 429:
                 print("=== Rate limited — stopping this round ===", flush=True)
                 break
